@@ -29,6 +29,14 @@ if (env.SENTRY_DSN) {
 
 const SLACK_BLOCK_LIMIT = 50;
 
+function isSignificantChange(oldItem: ShopItem, newItem: ShopItem): boolean {
+  return oldItem.price !== newItem.price || oldItem.stockRemaining !== newItem.stockRemaining;
+}
+
+function isDescriptionOrTitleChange(oldItem: ShopItem, newItem: ShopItem): boolean {
+  return oldItem.description !== newItem.description || oldItem.title !== newItem.title;
+}
+
 async function retry<T>(
   fn: () => Promise<T>,
   retries = 3,
@@ -52,86 +60,81 @@ async function retry<T>(
 async function uploadImagesForItems(items: ShopItem[]) {
   const imagesToUpload: string[] = [];
   const itemToImageIndex = new Map<ShopItem, number>();
-
   for (const item of items) {
     if (item.imageUrl) {
       itemToImageIndex.set(item, imagesToUpload.length);
       imagesToUpload.push(item.imageUrl);
     }
   }
-
   if (imagesToUpload.length > 0) {
     const uploaded = await uploadToCdn(imagesToUpload);
     for (const [item, idx] of itemToImageIndex.entries()) {
       item.imageUrl = uploaded[idx]!.deployedUrl;
     }
+    console.log(`⬆️ Uploaded ${imagesToUpload.length} files to CDN.`);
   }
 }
 
 async function run() {
   try {
     const slack = new WebClient(env.SLACK_XOXB);
-
     const currentItems = await retry(() => scrape(env.SOM_COOKIE));
     await uploadImagesForItems(currentItems);
-
     if (!(await exists(env.OLD_ITEMS_PATH))) {
       await writeItems(currentItems);
-      console.log(
-        `👋 First sync successful! Writing to \`${env.OLD_ITEMS_PATH}\``
-      );
+      console.log(`👋 First sync successful! Writing to \`${env.OLD_ITEMS_PATH}\``);
       return;
     }
-
     const oldItems = ShopItems(
       JSON.parse(await readFile(env.OLD_ITEMS_PATH, { encoding: "utf-8" }))
     );
     if (oldItems instanceof type.errors) {
       throw new Error(oldItems.summary);
     }
-
     if (deepEquals(oldItems, currentItems)) {
       console.log("✨ No shop updates detected.");
       return;
     }
-
     const updates = [];
     const newItemNames: string[] = [];
     const updatedItemNames: string[] = [];
     const deletedItemNames: string[] = [];
-
+    let shouldPingUserGroup = false;
     for (const currentItem of currentItems) {
       const oldItem = oldItems.find((item) => item.id === currentItem.id);
-
       if (!oldItem) {
         updates.push(JSXSlack(NewItem({ item: currentItem })));
         newItemNames.push(currentItem.title);
+        shouldPingUserGroup = true;
         continue;
       }
-
       if (deepEquals(oldItem, currentItem)) {
         continue;
       }
-
-      updates.push(JSXSlack(UpdatedItem({ oldItem, newItem: currentItem })));
-      updatedItemNames.push(oldItem.title);
+      const significant = isSignificantChange(oldItem, currentItem);
+      const minor = isDescriptionOrTitleChange(oldItem, currentItem);
+      if (significant) {
+        updates.push(JSXSlack(UpdatedItem({ oldItem, newItem: currentItem })));
+        updatedItemNames.push(oldItem.title);
+        shouldPingUserGroup = true;
+      } else if (minor) {
+        updates.push(JSXSlack(UpdatedItem({ oldItem, newItem: currentItem })));
+        updatedItemNames.push(oldItem.title);
+      }
     }
-
     for (const oldItem of oldItems) {
       const currentItem = currentItems.find((item) => item.id === oldItem.id);
       if (!currentItem) {
         updates.push(JSXSlack(DeletedItem({ item: oldItem })));
         deletedItemNames.push(oldItem.title);
+        shouldPingUserGroup = true;
       }
     }
-
     await writeItems(currentItems);
-
     console.log(`📰 ${updates.length} updates found.`);
     if (env.BLOCKS_LOG_PATH) {
       await writeFile(env.BLOCKS_LOG_PATH, JSON.stringify(updates, null, 2));
     }
-
     const notificationTexts = [];
     if (newItemNames.length > 0) {
       notificationTexts.push(`*new items:* ${newItemNames.join(", ")}`);
@@ -143,10 +146,9 @@ async function run() {
       notificationTexts.push(`*updated items:* ${updatedItemNames.join(", ")}`);
     }
     const notificationText = `✨ ${notificationTexts.join(" · ")}`;
-
     const allBlocks = updates.flat();
-    if (allBlocks.length === 0) throw new Error("Updates were detected, but we have no update blocks. This should never happen.");
-
+    if (allBlocks.length === 0)
+      throw new Error("Updates were detected, but we have no update blocks. This should never happen.");
     for (let i = 0; i < allBlocks.length; i += SLACK_BLOCK_LIMIT) {
       const chunk = allBlocks.slice(i, i + SLACK_BLOCK_LIMIT);
       const result = await retry(() =>
@@ -159,24 +161,20 @@ async function run() {
         })
       );
       if (!result.ok) {
-        throw new Error(
-          `Failed to send chunked Slack message: ${result.error}`
-        );
+        throw new Error(`Failed to send chunked Slack message: ${result.error}`);
       }
     }
-
-    await retry(() =>
-      slack.chat.postMessage({
-        text: notificationText,
-        blocks: JSXSlack(
-          UsergroupPing({ usergroupId: env.SLACK_USERGROUP_ID })
-        ),
-        channel: env.SLACK_CHANNEL_ID,
-        unfurl_links: false,
-        unfurl_media: false,
-      })
-    );
-
+    if (shouldPingUserGroup) {
+      await retry(() =>
+        slack.chat.postMessage({
+          text: notificationText,
+          blocks: JSXSlack(UsergroupPing({ usergroupId: env.SLACK_USERGROUP_ID })),
+          channel: env.SLACK_CHANNEL_ID,
+          unfurl_links: false,
+          unfurl_media: false,
+        })
+      );
+    }
     console.log("🙌 Run completed!");
   } catch (error) {
     console.error("Fatal error during run:", error);
@@ -209,12 +207,10 @@ async function uploadToCdn(urls: string[]) {
       body: JSON.stringify(urls),
     })
   );
-
   const text = await res.text();
   if (!res.ok) {
     throw new Error(`Error occurred whilst uploading ${urls} to CDN: ${text}`);
   }
-
   const json = cdnResponseSchema.assert(JSON.parse(text));
   console.log(`⬆️ Uploaded ${urls.length} files to CDN.`);
   return json.files;
